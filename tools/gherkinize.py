@@ -37,7 +37,7 @@ logger = logging.getLogger("gherkinize")
 pool = descriptor_pool.Default()
 
 class CelType:
-    def __init__(self, source: checked_pb2.Decl):
+    def from_decl(self, source: checked_pb2.Decl):
         self.source = source
         self.prefix = "celpy.celtypes."
         decl_kind = self.source.WhichOneof("decl_kind")
@@ -52,7 +52,8 @@ class CelType:
                 self.prefix = ""
                 self.name = "null_type"
             elif type_kind == "message_type":
-                self.name = f"TypeType(value='{type.message_type}')"
+                self.prefix = ""
+                self.name = type.message_type
             elif type_kind in ["map_type", "list_type"]:
                 self.name = type_kind
             else:
@@ -72,7 +73,7 @@ class Result:
         if self.kind == "value":
             self.literal = str(CelValue.from_proto(self.source.value))
         elif self.kind == "eval_error":
-            self.literal = self.source.eval_error.errors[0].message
+            self.literal = repr(self.source.eval_error.errors[0].message)
         else:
             raise Exception(f'Unable to interpret result kind "{self.kind}"')
 
@@ -102,13 +103,28 @@ class CelValue:
         elif value_kind == "list_value":
             return CelList(source.list_value)
         elif value_kind == "map_value":
-            return f"{{{', '.join([f'{CelValue.from_proto(e.key)}: {CelValue.from_proto(e.value)}' for e in source.map_value.entries])}}}"
+            return f"MapType({{{', '.join([f'{CelValue.from_proto(e.key)}: {CelValue.from_proto(e.value)}' for e in source.map_value.entries])}}})"
         elif value_kind == "type_value":
-            return f"TypeType(value={source.type_value!r})"
+            return f"TypeType(source={source.type_value!r})"
         elif value_kind == "object_value":
             return ProtoAny(source.object_value)
+        elif value_kind == "enum_value":
+            return CelEnum(source.enum_value)
         else:
             raise Exception(f'Unable to interpret value kind "{value_kind}"')
+
+class CelExprValue:
+    def __init__(self, source: value_pb2.Value):
+        self.source = source
+        expr_value_kind = self.source.WhichOneof("kind")
+
+        if expr_value_kind == "value":
+            self.literal = str(CelValue.from_proto(self.source.value))
+        else:
+            raise Exception(f'Unable to interpret CEL expression value kind "{expr_value_kind}"')
+
+    def __str__(self):
+        return self.literal
 
 class CelPrimitive(CelValue):
     def __str__(self):
@@ -143,6 +159,10 @@ class CelBytes(CelPrimitive):
     def __init__(self, source):
         self.type = "BytesType"
         self.source = source
+
+class CelEnum(CelPrimitive):
+    def __init__(self, source):
+        raise Exception("Enums not yet supported")
 
 class CelNull(CelValue):
     def __str__(self):
@@ -183,18 +203,21 @@ class ProtoAny:
         self.source = source
         type_name = self.source.type_url.split("/")[-1]
         desc = pool.FindMessageTypeByName(type_name)
-        messageValue = message_factory.GetMessageClass(desc)()
-        logger.debug(f"unpacking {type_name!r}")
-        self.source.Unpack(messageValue)
-        self.literal = str(ProtoMessage(messageValue))
+        message_value = message_factory.GetMessageClass(desc)()
+        self.source.Unpack(message_value)
+        if ProtoWrapper.is_wrapper(message_value):
+            self.literal = str(ProtoWrapper(message_value))
+        else:
+            self.literal = str(ProtoMessage(message_value))
 
     def __str__(self):
         return str(self.literal)
 
 
 class ProtoMessage:
-    def __init__(self, source: message.Message):
+    def __init__(self, source: message.Message, name_override = None):
         self.source = source
+        name = name_override if name_override is not None else self.source.DESCRIPTOR.name
         fieldLiterals = []
         fields = self.source.ListFields()
         for desc, value in fields:
@@ -202,7 +225,7 @@ class ProtoMessage:
                 fieldLiterals.append(f"{desc.name}={ProtoWrapper(value)}")
             else:
                 fieldLiterals.append(f"{desc.name}={value}")
-        self.literal = f"{self.source.DESCRIPTOR.name}({", ".join(fieldLiterals)})"
+        self.literal = f"{name}({", ".join(fieldLiterals)})"
 
     def __str__(self):
         return self.literal
@@ -225,14 +248,15 @@ class ProtoWrapper:
             self.literal = f"BytesType(source={self.source.value!r})"
         elif wrapper_kind in ["ListValue"]:
             self.literal = f"[{', '.join([str(ProtoValue(v)) for v in self.source.values])}]"
-        elif wrapper_kind in ["Struct"]:
+        elif wrapper_kind == "Struct":
             self.literal = str(ProtoStruct(self.source))
-        elif wrapper_kind in ["Value"]:
+        elif wrapper_kind == "Value":
             self.literal = str(ProtoValue(self.source))
-        elif wrapper_kind in ["Any"]:
+        elif wrapper_kind == "Any":
             self.literal = str(ProtoAny(self.source))
-        elif wrapper_kind in ["Duration", "Timestamp"]:
-            self.literal = str(ProtoMessage(self.source))
+        elif wrapper_kind == "Duration":
+            self.literal = str(ProtoMessage(self.source, "DurationType"))
+        # elif wrapper_kind == "Timestamp":
         else:
             raise Exception(f'Unable to interpret wrapper kind "{wrapper_kind}"')
 
@@ -280,6 +304,7 @@ class Proxy:
 
 class Scenario(Proxy):
     def __init__(self, source: simple_pb2.SimpleTest):
+        logger.debug(f"Scenario {source.name}")
         self.source = source
         self.preconditions = []
         self.events = []
@@ -292,8 +317,7 @@ class Scenario(Proxy):
         for type_env in self.source.type_env:
             self.given(f'type_env parameter "{type_env.name}" is {CelType(type_env)}')
         for key in self.source.bindings.keys():
-            self.given(f'bindings parameter "{key}" is TBD')
-            # self.given(f"bindings parameter {key} is {self.source.bindings[key]}")
+            self.given(f'bindings parameter "{key}" is {CelExprValue(self.source.bindings[key])}')
         if self.source.container:
             self.given(f"container is {self.source.container!r}")
 
@@ -332,8 +356,14 @@ class Scenario(Proxy):
 
 class Section(Proxy):
     def __init__(self, source: simple_pb2.SimpleTestSection):
+        logger.debug(f"Section {source.name}")
         self.source = source
-        self.scenarios = [Scenario(t) for t in source.test]
+        self.scenarios = []
+        for test in source.test:
+            try:
+                self.scenarios.append(Scenario(test))
+            except Exception as e:
+                logger.warn(f"Skipping scenario {test.name} because of error: {e}")
 
 
 class Feature(Proxy):
