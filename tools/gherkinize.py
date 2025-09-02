@@ -61,7 +61,7 @@ class CelValue:
         return (alias in [])
 
     @staticmethod
-    def get_class_by_alias(alias: str, base = None):
+    def get_class_by_alias(alias: str, base = None, error_on_none = True):
         base_class = base if base else CelValue
         classes = base_class.__subclasses__()
 
@@ -69,12 +69,12 @@ class CelValue:
             if child.is_aliased(alias):
                 return child
             else:
-                grandchild = child.get_class_by_alias(alias, child)
+                grandchild = child.get_class_by_alias(alias, child, False)
 
                 if grandchild is not None:
                     return grandchild
 
-        if base_class is CelValue:
+        if error_on_none:
             raise Exception(f"Unable to locate CEL value class for alias {alias!r}")
         else:
             return None
@@ -95,8 +95,7 @@ class CelType(CelValue):
         elif isinstance(value, value_pb2.Value):
             self.__from_cel_value(value)
         elif isinstance(value, str):
-            self.prefix = ""
-            self.name = value
+            self.__from_str(value)
         else:
             raise Exception(f'Unable to interpret type from {value.DESCRIPTOR.fullName} message')
 
@@ -128,10 +127,11 @@ class CelType(CelValue):
                     self.name = "BytesType"
             elif type_kind == "null":
                 self.prefix = ""
-                self.name = "None"
+                self.name = "NoneType # Decl"
             elif type_kind == "message_type":
                 self.prefix = ""
-                self.name = pool.FindMessageTypeByName(type.message_type).name
+                cel_class = CelValue.get_class_by_alias(type.message_type, None, False)
+                self.name = cel_class.type if cel_class else type.message_type
             elif type_kind in ["map_type"]:
                 self.name = "MapType"
             elif type_kind in ["list_type"]:
@@ -141,8 +141,7 @@ class CelType(CelValue):
         else:
             raise Exception(f'Unable to interpret declaration kind "{decl_kind}"')
 
-    def __from_cel_value(self, source: value_pb2.Value):
-        type_value = self.source.type_value
+    def __from_str(self, type_value: str):
         self.prefix = ""
         if type_value == "bool":
             self.name = "BoolType"
@@ -157,7 +156,7 @@ class CelType(CelValue):
         elif type_value == "map":
             self.name = "MapType"
         elif type_value == "null_type":
-            self.name = "None"
+            self.name = "NoneType # Type Value"
         elif type_value == "string":
             self.name = "StringType"
         elif type_value == "type":
@@ -167,7 +166,10 @@ class CelType(CelValue):
         elif type_value == "google.protobuf.Duration":
             self.name = "DurationType"
         else:
-            self.name = self.source.type_value
+            self.name = type_value
+
+    def __from_cel_value(self, source: value_pb2.Value):
+        self.__from_str(source.type_value)
 
     def __str__(self):
         return self.prefix + self.name
@@ -197,7 +199,7 @@ class CelInt(CelPrimitive):
 
     @staticmethod
     def is_aliased(alias: str):
-        return (alias in ["int64_value"])
+        return (alias in ["int64_value", "google.protobuf.Int32Value", "google.protobuf.Int64Value"])
 
 class CelUint(CelPrimitive):
     type = "celpy.celtypes.UintType"
@@ -243,7 +245,7 @@ class CelBytes(CelPrimitive):
     type = "celpy.celtypes.BytesType"
 
     def __init__(self, value):
-        super().__init__(value, "")
+        super().__init__(value)
 
     @staticmethod
     def is_aliased(alias: str):
@@ -254,7 +256,7 @@ class CelEnum(CelPrimitive):
         raise Exception("Enums not yet supported")
 
 class CelNull(CelValue):
-    type = "None"
+    type = "None # CelNull"
 
     def __init__(self, value):
         super().__init__(value)
@@ -264,15 +266,18 @@ class CelNull(CelValue):
         return (alias in ["null_value"])
 
     def __str__(self):
+        logger.debug("CellNull")
         return self.type
 
 class CelList(CelValue):
+    type = "celpy.celtypes.ListType"
+
     def __init__(self, value):
         super().__init__(value)
 
     @staticmethod
     def is_aliased(alias: str):
-        return (alias in ["list_value"])
+        return (alias in ["list", "list_value"])
 
     def __str__(self):
         return f"[{', '.join([str(CelValue.from_proto(v)) for v in self.value.values])}]"
@@ -307,7 +312,7 @@ class ProtoValue:
         value_kind = self.source.WhichOneof("kind")
 
         if value_kind == "null_value":
-            self.literal = "None"
+            self.literal = "None # ProtoValue"
         elif value_kind == "number_value":
             self.literal = f"DoubleType(source={self.source.number_value!r})"
         elif value_kind == "string_value":
@@ -384,11 +389,14 @@ class ProtoWrapper:
             self.literal = str(ProtoAny(self.source))
         elif wrapper_kind == "Duration":
             self.literal = str(ProtoMessage(self.source, "DurationType"))
+        elif wrapper_kind == "Timestamp":
+            self.literal = str(ProtoMessage(self.source, "TimestampType"))
         elif wrapper_kind == "TestAllTypes":
             self.literal = str(ProtoMessage(self.source, "TestAllTypes"))
-        # elif wrapper_kind == "Timestamp":
+        elif wrapper_kind == "NestedMessage":
+            self.literal = str(ProtoMessage(self.source, "NestedMessage"))
         else:
-            raise Exception(f'Unable to interpret wrapper kind "{wrapper_kind}"')
+            self.literal = str(ProtoMessage(self.source))
 
     @staticmethod
     def is_wrapper(message):
@@ -493,6 +501,7 @@ class Section(Proxy):
             try:
                 self.scenarios.append(Scenario(test))
             except Exception as e:
+                raise e
                 logger.warning(f"Skipping scenario {test.name} because of error: {e}")
 
 
@@ -505,7 +514,7 @@ class Feature(Proxy):
     def from_text_proto(path: Path) -> Self:
         logger.debug(f"Reading from {path}...")
         with open(path, encoding="utf_8") as file_handle:
-            text = file_handle.read()
+            text = file_handle.read().replace("google.api.expr.test.v1.", "cel.expr.conformance.").replace("protubuf", "protobuf")
             file = simple_pb2.SimpleTestFile()
             logger.debug(f"Parsing {path}...")
             text_format.Parse(text, file)
