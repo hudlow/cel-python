@@ -19,7 +19,7 @@
 
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 TOOLS = $(HERE)../tools
-CEL_SPEC_PATH ?= $(HERE)../../cel-spec
+CEL_SPEC_PATH ?= $(HERE)../../../google/cel-spec
 CEL_SIMPLE_TESTDATA ?= $(CEL_SPEC_PATH)/tests/simple/testdata
 
 # This is most -- but not all -- the feature files.
@@ -60,7 +60,7 @@ all : $(FEATURES)
 
 # Create Gherkin from the textproto serialization.
 %.feature : %.textproto
-	python $(TOOLS)/pb2g.py $^ -o $@
+	uv run $(TOOLS)/gherkinize.py -v $^ -o $@
 
 # Run the lark scanner to be sure the grammar works for *all* of the textproto files.
 # This is necessary because we don't have a full textproto implementation.

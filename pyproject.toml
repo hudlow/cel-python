@@ -38,6 +38,7 @@ dependencies = [
     "google-re2>=1.1.20250722; python_version == '3.13'",
     "google-re2>=1.1.20240702",
     "tomli >= 1.1.0 ; python_version < '3.11'",
+    "jinja2>=3.1.6",
 ]
 
 [project.scripts]
@@ -49,6 +50,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/celpy"]
+
+[[tool.uv.index]]
+url = "https://buf.build/gen/python"
 
 [dependency-groups]
 dev = [
@@ -63,4 +67,5 @@ dev = [
     "types-pyyaml>=6.0.12.20250516",
     "google-re2-stubs",
     "sphinxcontrib-plantuml>=0.30",
+    "google-cel-spec-protocolbuffers-python==32.0.0.1.20250512201741+dffb8c8cf781",
 ]

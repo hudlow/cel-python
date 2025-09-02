@@ -36,35 +36,6 @@ logger = logging.getLogger("gherkinize")
 
 pool = descriptor_pool.Default()
 
-class CelType:
-    def from_decl(self, source: checked_pb2.Decl):
-        self.source = source
-        self.prefix = "celpy.celtypes."
-        decl_kind = self.source.WhichOneof("decl_kind")
-
-        if decl_kind == "ident":
-            type = self.source.ident.type
-            type_kind = type.WhichOneof("type_kind")
-
-            if type_kind == "primitive":
-                self.name = checked_pb2.Type.PrimitiveType.Name(type.primitive)
-            elif type_kind == "null":
-                self.prefix = ""
-                self.name = "null_type"
-            elif type_kind == "message_type":
-                self.prefix = ""
-                self.name = type.message_type
-            elif type_kind in ["map_type", "list_type"]:
-                self.name = type_kind
-            else:
-                raise Exception(f'Unable to interpret type kind "{type_kind}"')
-        else:
-            raise Exception(f'Unable to interpret declaration kind "{decl_kind}"')
-
-    def __str__(self):
-        return self.prefix + self.name
-
-
 class Result:
     def __init__(self, source: simple_pb2.SimpleTest):
         self.source = source
@@ -75,43 +46,131 @@ class Result:
         elif self.kind == "eval_error":
             self.literal = repr(self.source.eval_error.errors[0].message)
         else:
-            raise Exception(f'Unable to interpret result kind "{self.kind}"')
+            raise Exception(f'Unable to interpret result kind {self.kind!r}')
 
     def __str__(self):
         return self.literal
 
 
 class CelValue:
+    def __init__(self, value):
+        self.value = value
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in [])
+
+    @staticmethod
+    def get_class_by_alias(alias: str, base = None):
+        base_class = base if base else CelValue
+        classes = base_class.__subclasses__()
+
+        for child in classes:
+            if child.is_aliased(alias):
+                return child
+            else:
+                grandchild = child.get_class_by_alias(alias, child)
+
+                if grandchild is not None:
+                    return grandchild
+
+        if base_class is CelValue:
+            raise Exception(f"Unable to locate CEL value class for alias {alias!r}")
+        else:
+            return None
+
     @staticmethod
     def from_proto(source: value_pb2.Value):
         value_kind = source.WhichOneof("kind")
+        return CelValue.get_class_by_alias(value_kind)(getattr(source, value_kind))
 
-        if value_kind in "int64_value":
-            return CelInt(source.int64_value)
-        elif value_kind == "uint64_value":
-            return CelUint(source.uint64_value)
-        elif value_kind == "double_value":
-            return CelDouble(source.double_value)
-        elif value_kind == "string_value":
-            return CelString(source.string_value)
-        elif value_kind == "bytes_value":
-            return CelBytes(source.bytes_value)
-        elif value_kind == "bool_value":
-            return CelBool(source.bool_value)
-        elif value_kind == "null_value":
-            return CelNull()
-        elif value_kind == "list_value":
-            return CelList(source.list_value)
-        elif value_kind == "map_value":
-            return f"MapType({{{', '.join([f'{CelValue.from_proto(e.key)}: {CelValue.from_proto(e.value)}' for e in source.map_value.entries])}}})"
-        elif value_kind == "type_value":
-            return f"TypeType(source={source.type_value!r})"
-        elif value_kind == "object_value":
-            return ProtoAny(source.object_value)
-        elif value_kind == "enum_value":
-            return CelEnum(source.enum_value)
+
+class CelType(CelValue):
+    def __init__(self, value):
+        super().__init__(value)
+        self.prefix = "celpy.celtypes."
+
+        if isinstance(value, checked_pb2.Decl):
+            self.__from_decl(value)
+        elif isinstance(value, value_pb2.Value):
+            self.__from_cel_value(value)
+        elif isinstance(value, str):
+            self.prefix = ""
+            self.name = value
         else:
-            raise Exception(f'Unable to interpret value kind "{value_kind}"')
+            raise Exception(f'Unable to interpret type from {value.DESCRIPTOR.fullName} message')
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["type_value"])
+
+    def __from_decl(self, value: checked_pb2.Decl):
+        decl_kind = self.value.WhichOneof("decl_kind")
+
+        if decl_kind == "ident":
+            type = self.value.ident.type
+            type_kind = type.WhichOneof("type_kind")
+
+            if type_kind == "primitive":
+                primitive_kind = checked_pb2.Type.PrimitiveType.Name(type.primitive)
+
+                if primitive_kind == "BOOL":
+                    self.name = "BoolType"
+                if primitive_kind == "INT64":
+                    self.name = "IntType"
+                if primitive_kind == "UINT64":
+                    self.name = "UintType"
+                if primitive_kind == "DOUBLE":
+                    self.name = "DoubleType"
+                if primitive_kind == "STRING":
+                    self.name = "StringType"
+                if primitive_kind == "BYTES":
+                    self.name = "BytesType"
+            elif type_kind == "null":
+                self.prefix = ""
+                self.name = "None"
+            elif type_kind == "message_type":
+                self.prefix = ""
+                self.name = pool.FindMessageTypeByName(type.message_type).name
+            elif type_kind in ["map_type"]:
+                self.name = "MapType"
+            elif type_kind in ["list_type"]:
+                self.name = "ListType"
+            else:
+                raise Exception(f'Unable to interpret type kind "{type_kind}"')
+        else:
+            raise Exception(f'Unable to interpret declaration kind "{decl_kind}"')
+
+    def __from_cel_value(self, source: value_pb2.Value):
+        type_value = self.source.type_value
+        self.prefix = ""
+        if type_value == "bool":
+            self.name = "BoolType"
+        elif type_value == "bytes":
+            self.name = "BytesType"
+        elif type_value == "double":
+            self.name = "DoubleType"
+        elif type_value == "int":
+            self.name = "IntType"
+        elif type_value == "list":
+            self.name = "ListType"
+        elif type_value == "map":
+            self.name = "MapType"
+        elif type_value == "null_type":
+            self.name = "None"
+        elif type_value == "string":
+            self.name = "StringType"
+        elif type_value == "type":
+            self.name = "TypeType"
+        elif type_value == "uint":
+            self.name = "UintType"
+        elif type_value == "google.protobuf.Duration":
+            self.name = "DurationType"
+        else:
+            self.name = self.source.type_value
+
+    def __str__(self):
+        return self.prefix + self.name
 
 class CelExprValue:
     def __init__(self, source: value_pb2.Value):
@@ -128,52 +187,119 @@ class CelExprValue:
 
 class CelPrimitive(CelValue):
     def __str__(self):
-        return f"{self.type}(source={self.source!r})"
+        return f"{self.type}(source={self.value!r})"
 
 class CelInt(CelPrimitive):
-    def __init__(self, source):
-        self.type = "IntType"
-        self.source = source
+    type = "celpy.celtypes.IntType"
+
+    def __init__(self, value):
+        super().__init__(value)
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["int64_value"])
 
 class CelUint(CelPrimitive):
-    def __init__(self, source):
-        self.type = "UintType"
-        self.source = source
+    type = "celpy.celtypes.UintType"
+
+    def __init__(self, value):
+        super().__init__(value)
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["uint64_value"])
 
 class CelDouble(CelPrimitive):
-    def __init__(self, source):
-        self.type = "DoubleType"
-        self.source = source
+    type = "celpy.celtypes.DoubleType"
+
+    def __init__(self, value):
+        super().__init__(value)
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["double_value"])
 
 class CelBool(CelPrimitive):
-    def __init__(self, source):
-        self.type = "BoolType"
-        self.source = source
+    type = "celpy.celtypes.BoolType"
+
+    def __init__(self, value):
+        super().__init__(value)
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["bool_value"])
 
 class CelString(CelPrimitive):
-    def __init__(self, source):
-        self.type = "StringType"
-        self.source = source
+    type = "celpy.celtypes.StringType"
+
+    def __init__(self, value):
+        super().__init__(value)
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["string_value"])
 
 class CelBytes(CelPrimitive):
-    def __init__(self, source):
-        self.type = "BytesType"
-        self.source = source
+    type = "celpy.celtypes.BytesType"
+
+    def __init__(self, value):
+        super().__init__(value, "")
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["bytes_value"])
 
 class CelEnum(CelPrimitive):
-    def __init__(self, source):
+    def __init__(self, value):
         raise Exception("Enums not yet supported")
 
 class CelNull(CelValue):
+    type = "None"
+
+    def __init__(self, value):
+        super().__init__(value)
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["null_value"])
+
     def __str__(self):
-        return "None"
+        return self.type
 
 class CelList(CelValue):
-    def __init__(self, source):
-        self.source = source
+    def __init__(self, value):
+        super().__init__(value)
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["list_value"])
 
     def __str__(self):
-        return f"[{', '.join([str(CelValue.from_proto(v)) for v in self.source.values])}]"
+        return f"[{', '.join([str(CelValue.from_proto(v)) for v in self.value.values])}]"
+
+class CelMap(CelValue):
+    type = "celpy.celtypes.MapType"
+
+    def __init__(self, value):
+        super().__init__(value)
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["map_value"])
+
+    def __str__(self):
+        return f"{self.type}({{{', '.join([f'{CelValue.from_proto(e.key)}: {CelValue.from_proto(e.value)}' for e in self.value.entries])}}})"
+
+class CelObject(CelValue):
+    def __init__(self, value):
+        super().__init__(ProtoAny(value))
+
+    @staticmethod
+    def is_aliased(alias: str):
+        return (alias in ["object_value"])
+
+    def __str__(self):
+        return str(self.value)
 
 class ProtoValue:
     def __init__(self, source: value_pb2.Value):
@@ -236,8 +362,10 @@ class ProtoWrapper:
         self.source = source
         wrapper_kind = self.source.DESCRIPTOR.name
 
-        if wrapper_kind in ["Int32Value", "Int64Value", "UInt32Value", "UInt64Value"]:
+        if wrapper_kind in ["Int32Value", "Int64Value"]:
             self.literal = f"IntType(source={self.source.value!r})"
+        elif wrapper_kind in ["UInt32Value", "UInt64Value"]:
+            self.literal = f"UintType(source={self.source.value!r})"
         elif wrapper_kind in ["DoubleValue", "FloatValue"]:
             self.literal = f"DoubleType(source={self.source.value!r})"
         elif wrapper_kind in ["BoolValue"]:
@@ -256,6 +384,8 @@ class ProtoWrapper:
             self.literal = str(ProtoAny(self.source))
         elif wrapper_kind == "Duration":
             self.literal = str(ProtoMessage(self.source, "DurationType"))
+        elif wrapper_kind == "TestAllTypes":
+            self.literal = str(ProtoMessage(self.source, "TestAllTypes"))
         # elif wrapper_kind == "Timestamp":
         else:
             raise Exception(f'Unable to interpret wrapper kind "{wrapper_kind}"')
@@ -363,7 +493,7 @@ class Section(Proxy):
             try:
                 self.scenarios.append(Scenario(test))
             except Exception as e:
-                logger.warn(f"Skipping scenario {test.name} because of error: {e}")
+                logger.warning(f"Skipping scenario {test.name} because of error: {e}")
 
 
 class Feature(Proxy):
